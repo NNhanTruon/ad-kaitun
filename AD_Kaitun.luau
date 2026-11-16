@@ -43,7 +43,7 @@ K.Config = {
     SkillDelay    = 1.15,             -- nhịp mỗi skill slot
     QueueTimeout  = 75,               -- giây chờ queue trước khi cancel + đổi map
     IdleRetry     = 45,               -- giây không kill enemy gì thì Retry
-    BlacklistTime = 300,              -- map queue fail bị cấm (giây)
+    BlacklistTime = 15,              -- map queue fail bị cấm (giây)
     -- Auto shop / loadout / cards
     AutoBuyChar   = true,             -- auto mua nhan vat manh nhat mua duoc (gem)
     AutoSlots     = true,             -- auto equip main + 2 assist
@@ -56,8 +56,16 @@ K.Config = {
     -- Fast entry / story sticky / white screen
     FastEntry     = true,             -- join nhanh 5-10s: CreateRoom + startGame truoc, QueuePlayer du phong
     StorySticky   = true,             -- story: replay lien tuc, chi back lobby khi duoc len map/diff
-    RetryCooldown = 12,               -- giay toi thieu giua 2 lan RetryDungeon
+    RetryCooldown = 4,               -- giay toi thieu giua 2 lan RetryDungeon
     WhiteScreen   = false,            -- bat l: tat render 3D (man hinh trang)
+    -- Combat position / dodge / hardcore
+    AutoHardcore = true,             -- bat: mac dinh ALL map hardcore (neu map cho phep)
+    FarmPos      = "Above",          -- "Above" bay tren dau enemy | "Below" duoi long dat | "Off"
+    FarmYOffset  = 5,                -- do cao bay tren dau enemy (studs)
+    BelowDepth   = 25,               -- do sau duoi long dat (studs)
+    AutoDodge    = true,             -- tu ne khi thay telegraph/AoE sap danh
+    DodgeRadius  = 14,               -- ban kinh them: bao xa thi ne (studs)
+    DodgeUp      = 10,               -- ne len cao bao nhieu
 }
 
 -----------------------------------------------------------------------
@@ -204,7 +212,7 @@ function K.EnterDungeon(map, diff)
     K.Entering = true
     K.QueueActive, K.QueueStart = true, now()
     K.QueueMap, K.QueueDiff = map, diff
-    K.TargetMap, K.TargetDiff = map, diff   -- story: giu target, khong doi khi chua du dieu kien
+    K.TargetMap, K.TargetDiff = map, diff
     task.spawn(function()
         local entered = false
         local t0 = now()
@@ -215,56 +223,42 @@ function K.EnterDungeon(map, diff)
             end
             return false
         end
-        -- 1) xoa state party/queue cu
+        -- hardcore state (mac dinh bat neu config va map cho phep)
+        local hc = false
+        if K.Config.AutoHardcore then
+            local info = (getSettings().MapInfo or {})[map]
+            if info and not info.noHardcore and not info.isRaid then hc = true end
+        end
+        -- 1) xoa party/queue cu
         pcall(function() fire("RemovePlayerFromParty") end)
         pcall(function() invoke("RemovePlayerFromQueue") end)
         task.wait(0.4)
-        -- 2) FAST PATH: CreateRoom + startGame (solo room, khong cho matchmaking)
-        local res = invoke("CreateRoom", { MapName = map, Difficulty = diff })
-        local st = type(res) == "table" and tostring(res.status) or "Sent"
-        K.Log(("CreateRoom %s [%s] -> %s"):format(map, diff, st))
-        task.wait(0.3)
-        pcall(function() require(lp.PlayerGui.Modules.RoomModule).startGame() end)
-        entered = pollGame(6)   -- ~6s la vao duoc
-        -- 3) Fallback: QueuePlayer matchmaking (toi da 45s)
-        if not entered then
-            local q = invoke("QueuePlayer", map, diff, false)
-            local qs = type(q) == "table" and tostring(q.status) or "Sent"
-            K.Log(("QueuePlayer -> %s"):format(qs))
-            if type(q) == "table" and q.status == "Fail" then
-                local msg = tostring(q.message or "")
-                if msg:find("arty") then
-                    pcall(function() fire("RemovePlayerFromParty") end)
-                    task.wait(1)
-                    q = invoke("QueuePlayer", map, diff, false)
-                    qs = type(q) == "table" and tostring(q.status) or "Sent"
-                    K.Log("QueuePlayer retry -> " .. qs)
-                end
-            end
-            if not (type(q) == "table" and q.status == "Fail") then
-                entered = pollGame(20)
-            end
-        end
-        -- 4) thu lai CreateRoom 1 lan
-        if not entered then
-            K.Log("Slow entry -> retry CreateRoom")
-            pcall(function() fire("RemovePlayerFromParty") end)
-            task.wait(0.5)
-            res = invoke("CreateRoom", { MapName = map, Difficulty = diff })
+        -- 2) SOLO: tao phong rieng va start (khong queue team)
+        local tries = 0
+        while not entered and tries < 3 do
+            tries += 1
+            local res = invoke("CreateRoom", { MapName = map, Difficulty = diff, Hardcore = hc })
+            local st = type(res) == "table" and tostring(res.status) or "Sent"
+            K.Log(("CreateRoom %s [%s]%s -> %s"):format(map, diff, hc and " [HARDCORE]" or "", st))
             task.wait(0.3)
             pcall(function() require(lp.PlayerGui.Modules.RoomModule).startGame() end)
             entered = pollGame(6)
+            if not entered then
+                K.Log("Solo entry chua vao -> thu lai " .. tostring(tries))
+                pcall(function() fire("RemovePlayerFromParty") end)
+                task.wait(1.5)
+            end
         end
         if entered then
-            K.Log(("ENTERED %s [%s] sau %.1fs"):format(map, diff, now() - t0))
+            K.Log(("ENTERED %s [%s]%s sau %.1fs"):format(map, diff, hc and " [HARDCORE]" or "", now() - t0))
             K.QueueStuck = 0
             K.Runs += 1
             if stat("Level") and stat("Level") >= 15 then
                 K.RaidDebt = (K.RaidDebt or 0) + 1
             end
         else
-            K.Log("Enter FAILED: " .. map .. " [" .. diff .. "]")
-            K.Ban[map] = now() + 60      -- ban nhe 60s, retry lai
+            K.Log("Enter FAILED: " .. map .. " [" .. diff .. "] -> ban 15s")
+            K.Ban[map] = now() + 15
             task.wait(8)
         end
         K.QueueActive = false
@@ -762,6 +756,26 @@ function K.BuildUI()
         wsBtn.Text = K.WhiteScreen and "WHITE: ON" or "WHITE: OFF"
         wsBtn.TextColor3 = K.WhiteScreen and Color3.fromRGB(255, 215, 90) or Color3.fromRGB(150, 150, 150)
     end)
+    local posBtn = Instance.new("TextButton")
+    posBtn.Name = "PosBtn"
+    posBtn.Size = UDim2.new(0, 66, 0, 20)
+    posBtn.Position = UDim2.new(1, -78, 0, 76)
+    posBtn.BackgroundColor3 = Color3.fromRGB(30, 45, 60)
+    posBtn.Text = "FLY: ABOVE"
+    posBtn.TextColor3 = Color3.fromRGB(120, 200, 255)
+    posBtn.Font = Enum.Font.GothamBold
+    posBtn.TextSize = 10
+    posBtn.Parent = main
+    corner(posBtn, 4)
+    posBtn.MouseButton1Click:Connect(function()
+        local order = { "Above", "Below", "Off" }
+        local idx = 1
+        for i, v in ipairs(order) do if K.Config.FarmPos == v then idx = i break end end
+        K.Config.FarmPos = order[(idx % #order) + 1]
+        local label = { Above = "FLY: ABOVE", Below = "FLY: BELOW", Off = "FLY: OFF" }
+        posBtn.Text = label[K.Config.FarmPos] or "FLY"
+        K.Log("FarmPos = " .. K.Config.FarmPos)
+    end)
 
     -- drag trên title
     do
@@ -850,6 +864,10 @@ function K.Start()
     K.BuildUI()
     table.insert(K.Threads, task.spawn(K.Supervisor))
     table.insert(K.Threads, task.spawn(K.CombatLoop))
+    table.insert(K.Threads, task.spawn(function()
+        pcall(function() K.StartDangerWatch() end)
+    end))
+    table.insert(K.Threads, task.spawn(K.PositionLoop))
     table.insert(K.Threads, task.spawn(function()
         while K.Running do
             task.wait(0.5)
@@ -1076,6 +1094,126 @@ function K.AutoCards()
             K.CardDeleted += #batch
             task.wait(0.8)
         end
+    end
+end
+
+-----------------------------------------------------------------------
+-- FARM POSITION: bay tren dau enemy / duoi long dat + AUTO NE telegraph
+-----------------------------------------------------------------------
+K.DangerParts = {}   -- [part] = {center, radius, t0, parent}
+
+local function isDangerPart(d)
+    if not d:IsA("BasePart") then return false end
+    if not d.Parent then return false end
+    local ok, res = pcall(function()
+        -- bo qua: ban do, effect cua minh, nguoi choi, enemy model
+        if d:IsDescendantOf(game.Workspace.GameMap) then return false end
+        local fn = d.Parent and d.Parent.Name or ""
+        if fn == "OwnEffects" or fn == "Players" or fn == "Monsters" or fn == "Pets" then return false end
+        local lp = game.Players.LocalPlayer
+        if lp.Character and d:IsDescendantOf(lp.Character) then return false end
+        -- telegraph: Neon/ForceField hoac do tiet, size lon
+        local sz = d.Size
+        if math.max(sz.X, sz.Y, sz.Z) < 7 then return false end
+        local isNeon = (d.Material == Enum.Material.Neon) or (d.Material == Enum.Material.ForceField)
+        local c = d.Color
+        local isRed = (c.R > 0.65) and (c.G < 0.35) and (c.B < 0.35)
+        if not (isNeon or isRed) then return false end
+        return true
+    end)
+    return ok and res or false
+end
+
+function K.StartDangerWatch()
+    if K.DangerConn then return end
+    K.DangerConn = game.Workspace.DescendantAdded:Connect(function(d)
+        pcall(function()
+            if not isDangerPart(d) then return end
+            local radius = math.max(d.Size.X, d.Size.Z) / 2
+            K.DangerParts[d] = { center = d.Position, radius = radius, t0 = tick(), name = d.Name }
+            if not K.DodgeDebugDone then
+                K.DodgeDebugDone = true
+                K.Log(("DANGER detected: %s (%s) size=%s color=%s"):format(d.Name, d.ClassName, tostring(d.Size), tostring(d.Color)))
+            end
+            task.delay(4.5, function()
+                if K.DangerParts then K.DangerParts[d] = nil end
+            end)
+        end)
+    end)
+end
+
+local function nearestEnemy(myHRP)
+    local M = game.Workspace:FindFirstChild("Folders")
+    M = M and M:FindFirstChild("Monsters")
+    if not M then return nil end
+    local best, bd = nil, math.huge
+    for _, e in ipairs(M:GetChildren()) do
+        local h = e:FindFirstChildWhichIsA("Humanoid")
+        local ehrp = e:FindFirstChild("HumanoidRootPart")
+        if h and h.Health > 0 and ehrp then
+            local d = (ehrp.Position - myHRP.Position).Magnitude
+            if d < bd then bd, best = d, ehrp end
+        end
+    end
+    return best, bd
+end
+
+function K.PositionTick()
+    local lp = game.Players.LocalPlayer
+    local char = lp.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildWhichIsA("Humanoid")
+    if not hrp or not hum or hum.Health <= 0 then return end
+    if K.Config.FarmPos == "Off" then return end
+    -- 1) auto ne: neu co telegraph sap danh gan minh -> di chuyen ngang
+    if K.Config.AutoDodge then
+        local nowT = tick()
+        for part, info in pairs(K.DangerParts) do
+            if part and part.Parent and nowT - info.t0 < 4.2 then
+                local flat = Vector3.new(hrp.Position.X, info.center.Y, hrp.Position.Z)
+                local dist = (flat - info.center).Magnitude
+                if dist < info.radius + K.Config.DodgeRadius then
+                    -- huong ne: thang tu part -> minh, them len tren
+                    local away = (hrp.Position - info.center)
+                    away = Vector3.new(away.X, 0, away.Z)
+                    if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) end
+                    away = away.Unit
+                    local target = hrp.Position + away * (info.radius + 8) + Vector3.new(0, K.Config.DodgeUp, 0)
+                    pcall(function()
+                        hrp.CFrame = CFrame.new(target)
+                        hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                    end)
+                    return
+                end
+            end
+        end
+    end
+    -- 2) trieu tap len tren dau / duoi long dat enemy gan nhat
+    local ehrp, dist = nearestEnemy(hrp)
+    if not ehrp then return end
+    local want
+    if K.Config.FarmPos == "Below" then
+        want = Vector3.new(ehrp.Position.X, ehrp.Position.Y - K.Config.BelowDepth, ehrp.Position.Z)
+    else
+        want = Vector3.new(ehrp.Position.X, ehrp.Position.Y + K.Config.FarmYOffset, ehrp.Position.Z)
+    end
+    local cur = hrp.Position
+    if (cur - want).Magnitude > 2 then
+        pcall(function()
+            hrp.CFrame = CFrame.new(want)
+            hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        end)
+    end
+end
+
+function K.PositionLoop()
+    while K.Running do
+        pcall(function()
+            if K.Config.AutoFarm and srvType() == "Game" then
+                K.PositionTick()
+            end
+        end)
+        task.wait(0.05)
     end
 end
 
