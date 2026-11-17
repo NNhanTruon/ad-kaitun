@@ -57,7 +57,9 @@ K.Config = {
     FastEntry     = true,             -- join nhanh 5-10s: CreateRoom + startGame truoc, QueuePlayer du phong
     StorySticky   = true,             -- story: replay lien tuc, chi back lobby khi duoc len map/diff
     RetryCooldown = 4,               -- giay toi thieu giua 2 lan RetryDungeon
-    WhiteScreen   = false,            -- bat l: tat render 3D (man hinh trang)
+    WhiteScreen   = true,             -- mac dinh BAT: tat render 3D (man hinh trang)
+    FlySpeed      = 0.10,             -- toc do bay (lerp alpha moi tick: nho = cham)
+    DodgeTween    = 0.22,             -- giayan tween khi ne chi thu (khong teleport)
     -- Combat position / dodge / hardcore
     AutoHardcore = true,             -- bat: mac dinh ALL map hardcore (neu map cho phep)
     FarmYOffset  = 5,                -- do cao bay tren dau enemy (studs)
@@ -65,9 +67,7 @@ K.Config = {
     AutoDodge    = true,             -- tu ne khi thay telegraph/AoE sap danh
     DodgeRadius  = 14,               -- ban kinh them: bao xa thi ne (studs)
     DodgeUp      = 10,               -- ne len cao bao nhieu
-    -- Walk mode / kick-detect
-    FarmPos      = "Walk",           -- "Walk" di bo autopath | "Above" bay tren dau | "Below" duoi dat | "Off"
-    WalkRange    = 4.5,              -- dung lai va danh khi cach enemy bao nhieu studs
+    FarmPos      = "Above",          -- "Above" bay tren dau enemy | "Below" duoi long dat | "Off"
     KickMarker   = "AD_Kaitun_KICKED.txt", -- file danh dau bi kick (executor FS)
 }
 
@@ -758,8 +758,8 @@ function K.BuildUI()
     wsBtn.Size = UDim2.new(0, 66, 0, 20)
     wsBtn.Position = UDim2.new(1, -78, 0, 54)
     wsBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
-    wsBtn.Text = "WHITE: OFF"
-    wsBtn.TextColor3 = Color3.fromRGB(150, 150, 150)
+    wsBtn.Text = K.Config.WhiteScreen and "WHITE: ON" or "WHITE: OFF"
+    wsBtn.TextColor3 = K.Config.WhiteScreen and Color3.fromRGB(255, 215, 90) or Color3.fromRGB(150, 150, 150)
     wsBtn.Font = Enum.Font.GothamBold
     wsBtn.TextSize = 10
     wsBtn.Parent = main
@@ -774,16 +774,18 @@ function K.BuildUI()
     posBtn.Size = UDim2.new(0, 66, 0, 20)
     posBtn.Position = UDim2.new(1, -78, 0, 76)
     posBtn.BackgroundColor3 = Color3.fromRGB(30, 45, 60)
-    posBtn.Text = "WALK: ON"    posBtn.TextColor3 = Color3.fromRGB(120, 200, 255)
+    posBtn.Text = "FLY: ABOVE"    posBtn.TextColor3 = Color3.fromRGB(120, 200, 255)
     posBtn.Font = Enum.Font.GothamBold
     posBtn.TextSize = 10
     posBtn.Parent = main
     corner(posBtn, 4)
     posBtn.MouseButton1Click:Connect(function()
-        local order = { "Walk", "Above", "Below", "Off" }        local idx = 1
+        local order = { "Above", "Below", "Off" }
+        local idx = 1
         for i, v in ipairs(order) do if K.Config.FarmPos == v then idx = i break end end
         K.Config.FarmPos = order[(idx % #order) + 1]
-        local label = { Walk = "WALK: ON", Above = "FLY: ABOVE", Below = "FLY: BELOW", Off = "FLY: OFF" }        posBtn.Text = label[K.Config.FarmPos] or "FLY"
+        local label = { Above = "FLY: ABOVE", Below = "FLY: BELOW", Off = "FLY: OFF" }
+        posBtn.Text = label[K.Config.FarmPos] or "FLY"
         K.Log("FarmPos = " .. K.Config.FarmPos)
     end)
 
@@ -1176,66 +1178,6 @@ local function nearestEnemy(myHRP)
     return best, bd
 end
 
--- DI BO autopath toi enemy (PathfindingService), dung lai o khoang cach WalkRange
-function K.WalkTick()
-    local lp = game.Players.LocalPlayer
-    local char = lp.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    local hum = char and char:FindFirstChildWhichIsA("Humanoid")
-    if not hrp or not hum or hum.Health <= 0 then return end
-    local ehrp, dist = nearestEnemy(hrp)
-    if not ehrp then
-        pcall(function() hum:MoveTo(hrp.Position) end)
-        return
-    end
-    if dist <= (K.Config.WalkRange or 4.5) then
-        pcall(function() hum:MoveTo(hrp.Position) end)  -- dung lai, combat bat dau danh
-        K.WalkTarget = nil
-        return
-    end
-    local nowT = tick()
-    local needNew = (not K.CurrentPath) or (not K.WalkTarget)
-        or (K.WalkTarget.Position - ehrp.Position).Magnitude > 8
-        or nowT - (K.LastPathCompute or 0) > 2
-    if K.WalkTarget and (K.WalkTarget.Position - hrp.Position).Magnitude > 120 then
-        needNew = true
-    end
-    if needNew then
-        K.WalkTarget = ehrp
-        K.LastPathCompute = nowT
-        local ok, path = pcall(function()
-            local ps = game:GetService("PathfindingService")
-            local p = ps:CreatePath({ AgentRadius = 3, AgentHeight = 6, AgentCanJump = true, AgentCanClimb = true })
-            p:ComputeAsync(ehrp.Position)
-            return p
-        end)
-        if ok and path and path.Status == Enum.PathStatus.Success then
-            K.CurrentPath = path
-            local wps = path:GetWaypoints()
-            if #wps > 1 then
-                pcall(function() hum:MoveTo(wps[2].Position) end)
-            elseif #wps == 1 then
-                pcall(function() hum:MoveTo(wps[1].Position) end)
-            end
-        else
-            pcall(function() hum:MoveTo(ehrp.Position) end)
-        end
-    else
-        if K.CurrentPath then
-            local wps = K.CurrentPath:GetWaypoints()
-            local nextWP = nil
-            for i = 2, #wps do
-                if (wps[i].Position - hrp.Position).Magnitude > 2 then nextWP = wps[i].Position break end
-            end
-            if nextWP then
-                pcall(function() hum:MoveTo(nextWP) end)
-            else
-                pcall(function() hum:MoveTo(ehrp.Position) end)
-            end
-        end
-    end
-end
-
 function K.PositionTick()
     local lp = game.Players.LocalPlayer
     local char = lp.Character
@@ -1243,31 +1185,31 @@ function K.PositionTick()
     local hum = char and char:FindFirstChildWhichIsA("Humanoid")
     if not hrp or not hum or hum.Health <= 0 then return end
     if K.Config.FarmPos == "Off" then return end
-    if K.Config.FarmPos == "Walk" then K.WalkTick() return end
-    -- 1) auto ne: neu co telegraph sap danh gan minh -> di chuyen ngang
+    -- 1) auto ne: TWEEN ra xa (khong teleport)
     if K.Config.AutoDodge then
         local nowT = tick()
         for part, info in pairs(K.DangerParts) do
             if part and part.Parent and nowT - info.t0 < 4.2 then
                 local flat = Vector3.new(hrp.Position.X, info.center.Y, hrp.Position.Z)
                 local dist = (flat - info.center).Magnitude
-                if dist < info.radius + K.Config.DodgeRadius then
-                    -- huong ne: thang tu part -> minh, them len tren
+                if dist < info.radius + K.Config.DodgeRadius and nowT - (K.LastDodge or -99) > 0.8 then
+                    K.LastDodge = nowT
                     local away = (hrp.Position - info.center)
                     away = Vector3.new(away.X, 0, away.Z)
                     if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) end
                     away = away.Unit
-                    local target = hrp.Position + away * (info.radius + 8) + Vector3.new(0, K.Config.DodgeUp, 0)
+                    local safePos = hrp.Position + away * (info.radius + 8) + Vector3.new(0, K.Config.DodgeUp, 0)
                     pcall(function()
-                        hrp.CFrame = CFrame.new(target)
-                        hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                        local TweenService = game:GetService("TweenService")
+                        local tw = TweenService:Create(hrp, TweenInfo.new(K.Config.DodgeTween, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { CFrame = CFrame.new(safePos) })
+                        tw:Play()
                     end)
                     return
                 end
             end
         end
     end
-    -- 2) trieu tap len tren dau / duoi long dat enemy gan nhat
+    -- 2) bay tween cham toi vi tri tren dau / duoi long dat enemy
     local ehrp, dist = nearestEnemy(hrp)
     if not ehrp then return end
     local want
@@ -1277,9 +1219,11 @@ function K.PositionTick()
         want = Vector3.new(ehrp.Position.X, ehrp.Position.Y + K.Config.FarmYOffset, ehrp.Position.Z)
     end
     local cur = hrp.Position
-    if (cur - want).Magnitude > 2 then
+    if (cur - want).Magnitude > 0.75 then
+        local alpha = math.clamp(K.Config.FlySpeed or 0.10, 0.01, 0.5)
         pcall(function()
-            hrp.CFrame = CFrame.new(want)
+            local goal = CFrame.new(want)
+            hrp.CFrame = hrp.CFrame:Lerp(goal, alpha)
             hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
         end)
     end
@@ -1361,6 +1305,7 @@ task.spawn(function()
         end
     end)
 
+    pcall(function() K.SetWhite(K.Config.WhiteScreen) end)
     local ok, err = pcall(function()
         local folder = RS:WaitForChild(lp.Name .. "StatDisplay", 10)
         K.Log("Stats folder: " .. (folder and "OK" or "waiting..."))
