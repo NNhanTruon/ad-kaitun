@@ -60,12 +60,15 @@ K.Config = {
     WhiteScreen   = false,            -- bat l: tat render 3D (man hinh trang)
     -- Combat position / dodge / hardcore
     AutoHardcore = true,             -- bat: mac dinh ALL map hardcore (neu map cho phep)
-    FarmPos      = "Above",          -- "Above" bay tren dau enemy | "Below" duoi long dat | "Off"
     FarmYOffset  = 5,                -- do cao bay tren dau enemy (studs)
     BelowDepth   = 25,               -- do sau duoi long dat (studs)
     AutoDodge    = true,             -- tu ne khi thay telegraph/AoE sap danh
     DodgeRadius  = 14,               -- ban kinh them: bao xa thi ne (studs)
     DodgeUp      = 10,               -- ne len cao bao nhieu
+    -- Walk mode / kick-detect
+    FarmPos      = "Walk",           -- "Walk" di bo autopath | "Above" bay tren dau | "Below" duoi dat | "Off"
+    WalkRange    = 4.5,              -- dung lai va danh khi cach enemy bao nhieu studs
+    KickMarker   = "AD_Kaitun_KICKED.txt", -- file danh dau bi kick (executor FS)
 }
 
 -----------------------------------------------------------------------
@@ -377,11 +380,21 @@ function K.CombatTick()
     if not hrp or not hum then return end
     if hum.Health <= 0 then
         if K.Config.AutoRevive then
+            K.DeadSince = K.DeadSince or now()
             invoke("RevivePlayer")
-            task.wait(2.2)
+            if now() - K.DeadSince > 20 then
+                -- ket >20s khong hoi duoc -> thoat phong ve lobby lam moi
+                K.Log("Chet ket >20s -> LeaveDungeon")
+                pcall(function() fire("LeaveDungeon") end)
+                K.DeadSince = nil
+                task.wait(5)
+            else
+                task.wait(2.2)
+            end
         end
         return
     end
+    K.DeadSince = nil
     local cf  = hrp.CFrame
     local t   = now()
     local fired = false
@@ -761,19 +774,16 @@ function K.BuildUI()
     posBtn.Size = UDim2.new(0, 66, 0, 20)
     posBtn.Position = UDim2.new(1, -78, 0, 76)
     posBtn.BackgroundColor3 = Color3.fromRGB(30, 45, 60)
-    posBtn.Text = "FLY: ABOVE"
-    posBtn.TextColor3 = Color3.fromRGB(120, 200, 255)
+    posBtn.Text = "WALK: ON"    posBtn.TextColor3 = Color3.fromRGB(120, 200, 255)
     posBtn.Font = Enum.Font.GothamBold
     posBtn.TextSize = 10
     posBtn.Parent = main
     corner(posBtn, 4)
     posBtn.MouseButton1Click:Connect(function()
-        local order = { "Above", "Below", "Off" }
-        local idx = 1
+        local order = { "Walk", "Above", "Below", "Off" }        local idx = 1
         for i, v in ipairs(order) do if K.Config.FarmPos == v then idx = i break end end
         K.Config.FarmPos = order[(idx % #order) + 1]
-        local label = { Above = "FLY: ABOVE", Below = "FLY: BELOW", Off = "FLY: OFF" }
-        posBtn.Text = label[K.Config.FarmPos] or "FLY"
+        local label = { Walk = "WALK: ON", Above = "FLY: ABOVE", Below = "FLY: BELOW", Off = "FLY: OFF" }        posBtn.Text = label[K.Config.FarmPos] or "FLY"
         K.Log("FarmPos = " .. K.Config.FarmPos)
     end)
 
@@ -864,6 +874,9 @@ function K.Start()
     K.BuildUI()
     table.insert(K.Threads, task.spawn(K.Supervisor))
     table.insert(K.Threads, task.spawn(K.CombatLoop))
+    table.insert(K.Threads, task.spawn(function()
+        pcall(function() K.StartKickWatch() end)
+    end))
     table.insert(K.Threads, task.spawn(function()
         pcall(function() K.StartDangerWatch() end)
     end))
@@ -1117,8 +1130,13 @@ local function isDangerPart(d)
         if math.max(sz.X, sz.Y, sz.Z) < 7 then return false end
         local isNeon = (d.Material == Enum.Material.Neon) or (d.Material == Enum.Material.ForceField)
         local c = d.Color
-        local isRed = (c.R > 0.65) and (c.G < 0.35) and (c.B < 0.35)
-        if not (isNeon or isRed) then return false end
+        local sat = math.max(c.R, c.G, c.B) - math.min(c.R, c.G, c.B)
+        local bright = math.max(c.R, c.G, c.B) > 0.55
+        local isVivid = bright and sat > 0.3
+        local nm = string.lower(d.Name)
+        local nameHit = nm:find("explosion") or nm:find("telegraph") or nm:find("attack")
+            or nm:find("zone") or nm:find("danger") or nm:find("warning") or nm:find("impact") or nm:find("aoe")
+        if not (isNeon or isVivid or nameHit) then return false end
         return true
     end)
     return ok and res or false
@@ -1158,6 +1176,66 @@ local function nearestEnemy(myHRP)
     return best, bd
 end
 
+-- DI BO autopath toi enemy (PathfindingService), dung lai o khoang cach WalkRange
+function K.WalkTick()
+    local lp = game.Players.LocalPlayer
+    local char = lp.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildWhichIsA("Humanoid")
+    if not hrp or not hum or hum.Health <= 0 then return end
+    local ehrp, dist = nearestEnemy(hrp)
+    if not ehrp then
+        pcall(function() hum:MoveTo(hrp.Position) end)
+        return
+    end
+    if dist <= (K.Config.WalkRange or 4.5) then
+        pcall(function() hum:MoveTo(hrp.Position) end)  -- dung lai, combat bat dau danh
+        K.WalkTarget = nil
+        return
+    end
+    local nowT = tick()
+    local needNew = (not K.CurrentPath) or (not K.WalkTarget)
+        or (K.WalkTarget.Position - ehrp.Position).Magnitude > 8
+        or nowT - (K.LastPathCompute or 0) > 2
+    if K.WalkTarget and (K.WalkTarget.Position - hrp.Position).Magnitude > 120 then
+        needNew = true
+    end
+    if needNew then
+        K.WalkTarget = ehrp
+        K.LastPathCompute = nowT
+        local ok, path = pcall(function()
+            local ps = game:GetService("PathfindingService")
+            local p = ps:CreatePath({ AgentRadius = 3, AgentHeight = 6, AgentCanJump = true, AgentCanClimb = true })
+            p:ComputeAsync(ehrp.Position)
+            return p
+        end)
+        if ok and path and path.Status == Enum.PathStatus.Success then
+            K.CurrentPath = path
+            local wps = path:GetWaypoints()
+            if #wps > 1 then
+                pcall(function() hum:MoveTo(wps[2].Position) end)
+            elseif #wps == 1 then
+                pcall(function() hum:MoveTo(wps[1].Position) end)
+            end
+        else
+            pcall(function() hum:MoveTo(ehrp.Position) end)
+        end
+    else
+        if K.CurrentPath then
+            local wps = K.CurrentPath:GetWaypoints()
+            local nextWP = nil
+            for i = 2, #wps do
+                if (wps[i].Position - hrp.Position).Magnitude > 2 then nextWP = wps[i].Position break end
+            end
+            if nextWP then
+                pcall(function() hum:MoveTo(nextWP) end)
+            else
+                pcall(function() hum:MoveTo(ehrp.Position) end)
+            end
+        end
+    end
+end
+
 function K.PositionTick()
     local lp = game.Players.LocalPlayer
     local char = lp.Character
@@ -1165,6 +1243,7 @@ function K.PositionTick()
     local hum = char and char:FindFirstChildWhichIsA("Humanoid")
     if not hrp or not hum or hum.Health <= 0 then return end
     if K.Config.FarmPos == "Off" then return end
+    if K.Config.FarmPos == "Walk" then K.WalkTick() return end
     -- 1) auto ne: neu co telegraph sap danh gan minh -> di chuyen ngang
     if K.Config.AutoDodge then
         local nowT = tick()
@@ -1215,6 +1294,54 @@ function K.PositionLoop()
         end)
         task.wait(0.05)
     end
+end
+
+-----------------------------------------------------------------------
+-- KICK DETECTOR: phat hien bi kick/exploit-detect -> ghi marker file
+-----------------------------------------------------------------------
+function K.StartKickWatch()
+    if K.KickConn then return end
+    local lp = game.Players.LocalPlayer
+    local function mark()
+        pcall(function()
+            writefile(K.Config.KickMarker, tostring(os.time()))
+            print("[AD_Kaitun] KICK DETECTED -> marker written")
+        end)
+    end
+    local ok, c = pcall(function()
+        return lp.AncestryChanged:Connect(function(_, parent)
+            if not parent or not parent.Parent then mark() end
+        end)
+    end)
+    K.KickConn = c
+    task.spawn(function()
+        while K.Running do
+            pcall(function()
+                local frames = {}
+                local mg = lp.PlayerGui:FindFirstChild("MainGui")
+                if mg then
+                    local ef = mg:FindFirstChild("ErrorFrame", true)
+                    if ef then table.insert(frames, ef) end
+                end
+                local ug = lp.PlayerGui:FindFirstChild("UniversalGui")
+                if ug then
+                    for _, d in ipairs(ug:GetDescendants()) do
+                        if d:IsA("TextLabel") then table.insert(frames, d) end
+                    end
+                end
+                for _, d in ipairs(frames) do
+                    if d:IsA("GuiObject") and d.Visible then
+                        local t = tostring(d.Text or ""):lower()
+                        if t:find("kick") or t:find("exploit") or t:find("cheat") or t:find("detected") or t:find("banned") then
+                            mark()
+                            return
+                        end
+                    end
+                end
+            end)
+            task.wait(2)
+        end
+    end)
 end
 
 -- boot

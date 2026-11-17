@@ -24,6 +24,17 @@ while true; do
     sleep 15
     continue
   fi
+  kick=$(timeout 10 adb -s $DEV shell "cat '/sdcard/Arceus X/AD_Kaitun_KICKED.txt' 2>/dev/null" | tr -d '\r\n')
+  if [ -n "$kick" ]; then
+    log "KICK DETECTED (marker)$kick -> force-stop + relaunch $PKG"
+    timeout 20 adb -s $DEV shell "rm -f '/sdcard/Arceus X/AD_Kaitun_KICKED.txt'" >> "$LOG" 2>&1
+    timeout 25 adb -s $DEV shell am force-stop $PKG >> "$LOG" 2>&1
+    sleep 8
+    timeout 25 adb -s $DEV shell am start -a android.intent.action.VIEW -d 'roblox://placeId=6938803436' $PKG >> "$LOG" 2>&1
+    killed=0
+    sleep 120
+    continue
+  fi
   if [ "$avail" -lt "$LOW_KB" ] && [ -n "$running" ]; then
     log "LOW RAM ${avail}KB (pid $running) -> force-stop $PKG"
     timeout 25 adb -s $DEV shell am force-stop $PKG >> "$LOG" 2>&1
